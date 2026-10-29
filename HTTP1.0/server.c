@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -14,34 +15,65 @@
 #define BUFFER_SIZE 2048
 #define HTML_FILE "helloworld.html"
 
+char* read_request(int socket, char* buffer, size_t buffer_size) {
+    ssize_t n = recv(socket, buffer, buffer_size - 1, 0);
+    if (n < 0) {
+        perror("error receiving request");
+        n = 0;
+    }
+    buffer[n] = '\0';
+    return buffer;
+}
 
-
-char * read_request(int socket, char* buffer, ssize_t length) {
-    char buffer[BUFFER_SIZE];
+void get_method(const char* request, char* method, size_t method_size) {
+    const char* sp = strchr(request, ' ');
+    if (sp == NULL) {
+        method[0] = '\0';
+        return;
+    }
+    size_t len = (size_t)(sp - request);
+    if (len >= method_size) {
+        len = method_size - 1;
+    }
+    memcpy(method, request, len);
+    method[len] = '\0';
 }
 
 int main() {
-    char* hdr = "HTTP/1.0 200 OK\r\n";
-    struct iovec headers[] = {
-        { .iov_base = "HTTP/1.0 200 OK\r\n", .iov_len = sizeof("HTTP/1.0 200 OK\r\n") - 1 },
-        { .iov_base = "Server: cwebserver1.1\r\n", .iov_len = sizeof("Server: cwebserver1.1\r\n") - 1 },
-        { .iov_base = "Content-type: text/html\r\n\r\n", .iov_len = sizeof("Content-type: text/html\r\n\r\n") - 1 },
-    };
-
-    struct sf_hdtr hdtr = {
-        .headers = headers,
-        .hdr_cnt = 3,
-        .trailers = NULL,
-        .trl_cnt = 0,
-    };
-
+    // --- prepare html ---
+    
     int htmlfd = open(HTML_FILE, O_RDONLY);
     if (htmlfd < 0) {
         printf("error opening %s\n", HTML_FILE);
         return EXIT_FAILURE;
     }
+
+    struct stat st;
+    fstat(htmlfd, &st);
     
-    char buffer[BUFFER_SIZE];
+    // --- headers ---
+    
+    char status[] = "HTTP/1.0 200 OK\r\n";
+    char server[] = "Server: cwebserver\r\n";
+    char content_type[] = "Content-Type: text/html\r\n";
+    char content_len[32];
+    snprintf(content_len, sizeof(content_len), "Content-Length: %ld\r\n\r\n", (long)st.st_size);
+    struct iovec headers[] = {
+        { .iov_base = status, .iov_len = strlen(status) },
+        { .iov_base = server, .iov_len = strlen(server) },
+        { .iov_base = content_type, .iov_len = strlen(content_type) },
+        { .iov_base = content_len, .iov_len = strlen(content_len) },
+    };
+
+    struct sf_hdtr hdtr = {
+        .headers = headers,
+        .hdr_cnt = 4,
+        .trailers = NULL,
+        .trl_cnt = 0,
+    };
+
+    // --- socket ---
+    
     int sock = socket(PF_INET, SOCK_STREAM, 0);
     if (sock == -1) {
         perror("error creating socket");
@@ -68,6 +100,8 @@ int main() {
         printf("socket listening on port %d\n", PORT);
     }
 
+    // --- accept connections ---
+
     for (;;) {
         struct sockaddr client_addr;
         socklen_t client_addrlen = sizeof(client_addr);
@@ -85,22 +119,28 @@ int main() {
             continue;
         }
 
-        ssize_t read_res = read(new_sock, buffer, BUFFER_SIZE - 1);
-        if (read_res < 0) {
-            perror("failed to read request");
-            close(new_sock);
-            continue;
+        char buffer[BUFFER_SIZE];
+        char method[5];
+        char* req = read_request(new_sock, buffer, sizeof(buffer));
+        get_method(req, method, sizeof(method));
+
+        if (strcmp(method, "GET") == 0) {
+            off_t sent = 0;
+            if (sendfile(htmlfd, new_sock, 0, &sent, &hdtr, 0) < 0) {
+                perror("error sending file to client");
+            } else {
+                printf("%lld bytes sent to client\n", (long long)sent);
+            }
+        } else if (strcmp(method, "HEAD") == 0) {
+            // TODO
+        } else if (method[0] != '\0') {
+            char resp[] = "HTTP/1.0 405 Method Not Allowed\r\n\r\n";
+            write(new_sock, resp, strlen(resp));
         } else {
-            buffer[read_res] = '\0';
-            printf("received request: %s", buffer);
+            char resp[] = "HTTP/1.0 400 Bad Request\r\n\r\n";
+            write(new_sock, resp, strlen(resp));
         }
 
-        off_t sent = 0;
-        if (sendfile(htmlfd, new_sock, 0, &sent, &hdtr, 0) < 0) {
-            perror("error sending file to client");
-        } else {
-            printf("%lld bytes sent to client\n", (long long)sent);
-        }
         close(new_sock);
     }
 
