@@ -9,11 +9,18 @@
 #include <sys/uio.h>
 #include <fcntl.h>
 #include <string.h>
+#include <pthread.h>
 
 #define PORT 8081
 #define MAX_QUEUE 128 // max length for queue of pending connections
 #define BUFFER_SIZE 2048
 #define HTML_FILE "helloworld.html"
+
+typedef struct {
+    int client_sock;
+    int htmlfd;
+    struct sf_hdtr* hdtr;
+} connection_args;
 
 char* read_request(int socket, char* buffer, size_t buffer_size) {
     ssize_t n = recv(socket, buffer, buffer_size - 1, 0);
@@ -37,6 +44,41 @@ void get_method(const char* request, char* method, size_t method_size) {
     }
     memcpy(method, request, len);
     method[len] = '\0';
+}
+
+void* handle_connection(void* args) {
+    connection_args* conn_args = (connection_args*)args;
+    int client_sock = conn_args->client_sock;
+    int htmlfd = conn_args->htmlfd;
+    struct sf_hdtr *hdtr = conn_args->hdtr;
+    free(conn_args);
+
+    char buffer[BUFFER_SIZE];
+    char method[5];
+    char* req = read_request(client_sock, buffer, sizeof(buffer));
+    get_method(req, method, sizeof(method));
+
+    if (strcmp(method, "GET") == 0) {
+        off_t sent = 0;
+        if (sendfile(htmlfd, client_sock, 0, &sent, &hdtr, 0) < 0) {
+            perror("error sending file to client");
+        } else {
+            printf("%lld bytes sent to client\n", (long long)sent);
+        }
+    } else if (strcmp(method, "HEAD") == 0) {
+        // TODO
+        char resp[] = "HTTP/1.0 501 Not Implemented\r\n\r\n";
+        write(client_sock, resp, strlen(resp));
+    } else if (method[0] != '\0') {
+        char resp[] = "HTTP/1.0 405 Method Not Allowed\r\n\r\n";
+        write(client_sock, resp, strlen(resp));
+    } else {
+        char resp[] = "HTTP/1.0 400 Bad Request\r\n\r\n";
+        write(client_sock, resp, strlen(resp));
+    }
+
+    close(client_sock);
+    return NULL;
 }
 
 int main() {
@@ -119,29 +161,21 @@ int main() {
             continue;
         }
 
-        char buffer[BUFFER_SIZE];
-        char method[5];
-        char* req = read_request(new_sock, buffer, sizeof(buffer));
-        get_method(req, method, sizeof(method));
+        // --- concurrency via threads ---
 
-        if (strcmp(method, "GET") == 0) {
-            off_t sent = 0;
-            if (sendfile(htmlfd, new_sock, 0, &sent, &hdtr, 0) < 0) {
-                perror("error sending file to client");
-            } else {
-                printf("%lld bytes sent to client\n", (long long)sent);
-            }
-        } else if (strcmp(method, "HEAD") == 0) {
-            // TODO
-        } else if (method[0] != '\0') {
-            char resp[] = "HTTP/1.0 405 Method Not Allowed\r\n\r\n";
-            write(new_sock, resp, strlen(resp));
-        } else {
-            char resp[] = "HTTP/1.0 400 Bad Request\r\n\r\n";
-            write(new_sock, resp, strlen(resp));
+        connection_args* args = malloc(sizeof(connection_args));
+        args->client_sock = new_sock;
+        args->htmlfd = htmlfd;
+        args->hdtr = &hdtr;
+
+        pthread_t tid;
+        if (pthread_create(tid, NULL, handle_connection, args) != 0) {
+            perror("error creating thread");
+            close(new_sock);
+            free(args);
+            continue;
         }
-
-        close(new_sock);
+        pthread_detach(tid);
     }
 
     close(sock);
