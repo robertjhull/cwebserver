@@ -60,7 +60,7 @@ void* handle_connection(void* args) {
 
     if (strcmp(method, "GET") == 0) {
         off_t sent = 0;
-        if (sendfile(htmlfd, client_sock, 0, &sent, &hdtr, 0) < 0) {
+        if (sendfile(htmlfd, client_sock, 0, &sent, hdtr, 0) < 0) {
             perror("error sending file to client");
         } else {
             printf("%lld bytes sent to client\n", (long long)sent);
@@ -169,7 +169,7 @@ int main() {
         args->hdtr = &hdtr;
 
         pthread_t tid;
-        if (pthread_create(tid, NULL, handle_connection, args) != 0) {
+        if (pthread_create(&tid, NULL, handle_connection, args) != 0) {
             perror("error creating thread");
             close(new_sock);
             free(args);
